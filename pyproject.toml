@@ -1,0 +1,7 @@
+[project]
+name = "horny-toad"
+version = "0.1.0"
+description = "Internal research prototype under Komi"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
