@@ -14,3 +14,7 @@ __pycache__/
 
 # Extra
 docs/
+AGENTS.md
+CLAUDE.md
+sim-web/node_modules/
+sim-web/dist/
