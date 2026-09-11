@@ -1,191 +1,372 @@
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { SimulationGrid } from '../engine/simulation.ts';
 import { TOKEN_COLORS } from '../engine/constants.ts';
-import { animate as anime } from 'animejs';
 
 interface GridCanvasProps {
   grid: SimulationGrid;
   viewMode: '1bit' | 'dialect';
   showSynapses: boolean;
+  /** Bump on clear / restart / preset load to snap visuals to the new grid. */
+  visualEpoch: number;
 }
 
-export const GridCanvas: React.FC<GridCanvasProps> = ({ grid, viewMode, showSynapses }) => {
+interface CellVisual {
+  intensity: number;
+  scale: number;
+  trail: number;
+  ghost: number; // death-only smear, independent of intensity
+  flash: number;
+  jitter: number;
+  aliveTarget: boolean;
+  agePhase: number;
+}
+
+/** Birth punch */
+const BIRTH_SCALE_PEAK = 1.45;
+const BIRTH_SCALE_SETTLE = 1.0;
+/** Death collapse */
+const DEATH_SCALE_END = 0.12;
+/** Solid discs that nearly touch — no bloom */
+const CORE_RADIUS = 0.86;
+const SYNAPSE_PULSE_DECAY = 1 / 0.4;
+/** Explicit phosphor trail (framebuffer is hard-cleared to avoid washout) */
+const TRAIL_DECAY_DEAD = 0.55; // ~1.5s smear — readable death
+const TRAIL_DECAY_ALIVE = 1.4;
+
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace('#', '');
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
+}
+
+function makeVisuals(count: number): CellVisual[] {
+  return Array.from({ length: count }, () => ({
+    intensity: 0,
+    scale: 0,
+    trail: 0,
+    ghost: 0,
+    flash: 0,
+    jitter: 0,
+    aliveTarget: false,
+    agePhase: Math.random() * Math.PI * 2,
+  }));
+}
+
+function snapVisualsToGrid(grid: SimulationGrid, visuals: CellVisual[]) {
+  const n = grid.width * grid.height;
+  for (let i = 0; i < n; i++) {
+    const alive = grid.cells[i].alive;
+    visuals[i].aliveTarget = alive;
+    visuals[i].intensity = alive ? 1 : 0;
+    visuals[i].scale = alive ? BIRTH_SCALE_SETTLE : 0;
+    visuals[i].trail = 0;
+    visuals[i].ghost = 0;
+    visuals[i].flash = 0;
+    visuals[i].jitter = 0;
+  }
+}
+
+function approach(current: number, target: number, rate: number, dt: number): number {
+  const t = 1 - Math.exp(-rate * dt);
+  return current + (target - current) * t;
+}
+
+export const GridCanvas: React.FC<GridCanvasProps> = ({
+  grid,
+  viewMode,
+  showSynapses,
+  visualEpoch,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isMouseDownRef = useRef(false);
   const lastDrawnCellRef = useRef<string | null>(null);
 
-  // Maintain cell animations state for Anime.js
-  const cellAnims = useMemo(() => {
-    return Array.from({ length: grid.width * grid.height }).map(() => ({
-      scale: 0,
-      opacity: 0,
-    }));
-  }, [grid.width, grid.height]);
+  const visualsRef = useRef<CellVisual[]>(makeVisuals(grid.width * grid.height));
+  const lastTimeRef = useRef<number>(performance.now());
+  const lastSubTurnRef = useRef<number>(grid.stats.subTurn);
+  const lastGenRef = useRef<number>(grid.stats.generation);
+  const synapsePulseRef = useRef<number>(1);
+  const genFlashRef = useRef<number>(0);
+  const noisePhaseRef = useRef<number>(0);
 
-  // Track previous alive states to trigger animations on diffs
-  const prevAliveRef = useRef<boolean[]>(
-    Array.from({ length: grid.width * grid.height }).map(() => false)
-  );
-
-  // Sync cell logic state changes to Anime.js targets
   useEffect(() => {
-    // Only run diffs if evaluation is not complete, ensuring animations halt naturally at 45s.
-    // If it's complete, wait for the animations to finish settling.
-    if (grid.stats.isComplete) return;
-
-    const w = grid.width;
-    const h = grid.height;
-    const prev = prevAliveRef.current;
-
-    for (let i = 0; i < w * h; i++) {
-      const isAlive = grid.cells[i].alive;
-      if (isAlive !== prev[i]) {
-        prev[i] = isAlive;
-        
-        // Remove any existing animation for this cell
-        // remove(cellAnims[i]);
-        
-        if (isAlive) {
-          // Cell Birth
-          anime(
-            cellAnims[i], {
-            scale: 1,
-            opacity: 1,
-            duration: 350,
-            easing: 'easeOutBack',
-          });
-        } else {
-          // Cell Death
-          anime(
-            cellAnims[i], {
-            scale: 0,
-            opacity: 0,
-            duration: 350,
-            easing: 'easeOutQuad',
-          });
-        }
-      }
+    if (visualsRef.current.length !== grid.width * grid.height) {
+      visualsRef.current = makeVisuals(grid.width * grid.height);
     }
-  }, [grid.stats.subTurn, grid.stats.generation]); // Run diff logic when the grid updates internally
+    snapVisualsToGrid(grid, visualsRef.current);
+    lastSubTurnRef.current = grid.stats.subTurn;
+    lastGenRef.current = grid.stats.generation;
+    synapsePulseRef.current = 1;
+    genFlashRef.current = 0;
 
-  // Continuous 60 FPS Render Loop
+    // Hard wipe on reset so phosphor ghosts don't linger from the old cosmos
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (canvas && ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [visualEpoch, grid.width, grid.height]);
+
   useEffect(() => {
-    let animationFrameId: number;
+    let raf = 0;
 
-    const renderLoop = () => {
+    const renderLoop = (now: number) => {
       const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const width = canvas.width;
-          const height = canvas.height;
-          const cellW = width / grid.width;
-          const cellH = height / grid.height;
+      if (!canvas) {
+        raf = requestAnimationFrame(renderLoop);
+        return;
+      }
 
-          // 1. Black background
-          ctx.fillStyle = '#000000';
-          ctx.fillRect(0, 0, width, height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        raf = requestAnimationFrame(renderLoop);
+        return;
+      }
 
-          // 2. Subtle retro scanline grid
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
-          ctx.lineWidth = 0.5;
-          for (let x = 0; x <= grid.width; x += 2) {
-            ctx.beginPath();
-            ctx.moveTo(x * cellW, 0);
-            ctx.lineTo(x * cellW, height);
-            ctx.stroke();
+      const dt = Math.min(0.05, (now - lastTimeRef.current) / 1000);
+      lastTimeRef.current = now;
+      noisePhaseRef.current += dt;
+
+      const w = grid.width;
+      const h = grid.height;
+      const visuals = visualsRef.current;
+      const cells = grid.cells;
+
+      // Generation flip → global glitch flash + per-cell birth/death punches
+      const genChanged = grid.stats.generation !== lastGenRef.current;
+      const subChanged = grid.stats.subTurn !== lastSubTurnRef.current;
+      if (genChanged || subChanged) {
+        lastSubTurnRef.current = grid.stats.subTurn;
+        lastGenRef.current = grid.stats.generation;
+        synapsePulseRef.current = 1;
+        if (genChanged) {
+          genFlashRef.current = 1;
+        }
+      } else {
+        synapsePulseRef.current = Math.max(
+          0.22,
+          synapsePulseRef.current - SYNAPSE_PULSE_DECAY * dt
+        );
+        genFlashRef.current = Math.max(0, genFlashRef.current - dt * 3.2);
+      }
+
+      for (let i = 0; i < w * h; i++) {
+        const alive = cells[i].alive;
+        const v = visuals[i];
+        v.agePhase += dt * (2.2 + (i % 7) * 0.15);
+
+        if (alive !== v.aliveTarget) {
+          if (alive) {
+            // BIRTH — hard pop in, overshoot scale, white flash
+            v.intensity = 1.2;
+            v.scale = 0.02;
+            v.flash = 1;
+            v.jitter = 1;
+            v.trail = Math.max(v.trail, 0.55);
+          } else {
+            // DEATH — flash + long ghost smear (LIFE.gif phosphor)
+            v.flash = 1;
+            v.jitter = 1;
+            v.trail = 1.2;
+            v.ghost = 1;
+            v.intensity = 0.9;
+            v.scale = Math.max(v.scale, BIRTH_SCALE_PEAK);
           }
-          for (let y = 0; y <= grid.height; y += 2) {
-            ctx.beginPath();
-            ctx.moveTo(0, y * cellH);
-            ctx.lineTo(width, y * cellH);
-            ctx.stroke();
-          }
+          v.aliveTarget = alive;
+        }
 
-          // 3. Render Synaptic Dialogue Beams
-          if (showSynapses && grid.synapses.length > 0) {
-            for (const syn of grid.synapses) {
-              const sx = (syn.x1 + 0.5) * cellW;
-              const sy = (syn.y1 + 0.5) * cellH;
-              const tx = (syn.x2 + 0.5) * cellW;
-              const ty = (syn.y2 + 0.5) * cellH;
+        if (alive) {
+          v.intensity = approach(v.intensity, 1, 14, dt);
+          // Punch scale up to peak then settle
+          const scaleTarget =
+            v.flash > 0.35 ? BIRTH_SCALE_PEAK : BIRTH_SCALE_SETTLE;
+          v.scale = approach(v.scale, scaleTarget, v.flash > 0.2 ? 18 : 10, dt);
+          // Living shimmer / glitch from miscommunication
+          const glitch = cells[i].glitch || 0;
+          const shimmer =
+            0.04 * Math.sin(v.agePhase) + glitch * 0.12 * Math.sin(v.agePhase * 7.3);
+          v.intensity = Math.min(1.15, Math.max(0.75, v.intensity + shimmer * dt * 8));
+          v.ghost = Math.max(0, v.ghost - dt * 2.5);
+        } else {
+          // Slow intensity death so the smear reads; scale collapses a bit faster
+          v.intensity = approach(v.intensity, 0, 4.2, dt);
+          v.scale = approach(v.scale, DEATH_SCALE_END, 6.5, dt);
+          v.ghost = Math.max(0, v.ghost - dt * TRAIL_DECAY_DEAD);
+        }
 
-              ctx.beginPath();
-              ctx.moveTo(sx, sy);
-              ctx.lineTo(tx, ty);
+        v.flash = Math.max(0, v.flash - dt * 3.8);
+        v.jitter = Math.max(0, v.jitter - dt * 4.8);
+        v.trail = Math.max(0, v.trail - dt * (alive ? TRAIL_DECAY_ALIVE : TRAIL_DECAY_DEAD));
 
-              if (syn.direction === 'outbound') {
-                ctx.strokeStyle = viewMode === '1bit' ? 'rgba(255, 255, 255, 0.3)' : TOKEN_COLORS[syn.token] + '99';
-                ctx.lineWidth = 1;
-              } else if (syn.direction === 'inbound') {
-                ctx.strokeStyle = 'rgba(168, 85, 247, 0.4)';
-                ctx.lineWidth = 1;
-                ctx.setLineDash([2, 2]);
-              } else {
-                ctx.strokeStyle = viewMode === '1bit' ? 'rgba(255, 255, 255, 0.6)' : TOKEN_COLORS[syn.token];
-                ctx.lineWidth = 1.5;
-                ctx.setLineDash([]);
-              }
+        if (v.intensity < 0.01) v.intensity = 0;
+        if (v.trail < 0.01) v.trail = 0;
+        if (v.ghost < 0.01) v.ghost = 0;
+        if (!alive && v.intensity === 0 && v.trail === 0 && v.ghost === 0) v.scale = 0;
+      }
 
-              ctx.stroke();
-              ctx.setLineDash([]);
+      const width = canvas.width;
+      const height = canvas.height;
+      const cellW = width / w;
+      const cellH = height / h;
+      const minCell = Math.min(cellW, cellH);
+
+      // 1. Hard clear — trails are explicit per-cell (avoids additive washout fog)
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, width, height);
+
+      // Generation glitch bar flash
+      if (genFlashRef.current > 0.02) {
+        ctx.fillStyle = `rgba(255,255,255,${0.045 * genFlashRef.current})`;
+        ctx.fillRect(0, 0, width, height);
+        // A few horizontal tear lines
+        const tears = 3 + Math.floor(genFlashRef.current * 4);
+        for (let t = 0; t < tears; t++) {
+          const ty =
+            ((noisePhaseRef.current * 90 + t * 137.17) % 1) * height;
+          ctx.fillStyle = `rgba(255,255,255,${0.08 * genFlashRef.current})`;
+          ctx.fillRect(0, ty, width, 1 + genFlashRef.current * 2);
+        }
+      }
+
+      // 2. Faint scan lattice
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
+      ctx.lineWidth = 0.5;
+      for (let x = 0; x <= w; x += 2) {
+        ctx.beginPath();
+        ctx.moveTo(x * cellW, 0);
+        ctx.lineTo(x * cellW, height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= h; y += 2) {
+        ctx.beginPath();
+        ctx.moveTo(0, y * cellH);
+        ctx.lineTo(width, y * cellH);
+        ctx.stroke();
+      }
+
+      // 3. Synapses
+      if (showSynapses && grid.synapses.length > 0) {
+        const pulse = synapsePulseRef.current;
+        const modeMul = viewMode === '1bit' ? 0.18 : 1;
+        for (const syn of grid.synapses) {
+          const sx = (syn.x1 + 0.5) * cellW;
+          const sy = (syn.y1 + 0.5) * cellH;
+          const tx = (syn.x2 + 0.5) * cellW;
+          const ty = (syn.y2 + 0.5) * cellH;
+
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(tx, ty);
+
+          if (syn.direction === 'outbound') {
+            if (viewMode === '1bit') {
+              ctx.strokeStyle = `rgba(255,255,255,${0.3 * pulse * modeMul})`;
+            } else {
+              const [r, g, b] = hexToRgb(TOKEN_COLORS[syn.token]);
+              ctx.strokeStyle = `rgba(${r},${g},${b},${0.55 * pulse})`;
             }
+            ctx.lineWidth = 1;
+            ctx.setLineDash([]);
+          } else if (syn.direction === 'inbound') {
+            ctx.strokeStyle = `rgba(168, 85, 247,${0.4 * pulse * modeMul})`;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 2]);
+          } else {
+            if (viewMode === '1bit') {
+              ctx.strokeStyle = `rgba(255,255,255,${0.45 * pulse * modeMul})`;
+            } else {
+              const [r, g, b] = hexToRgb(TOKEN_COLORS[syn.token]);
+              ctx.strokeStyle = `rgba(${r},${g},${b},${0.85 * pulse})`;
+            }
+            ctx.lineWidth = 1.4;
+            ctx.setLineDash([]);
           }
 
-          // 4. Render Cellular Grid (Authentic Game of Life Anime.js Dots)
-          const w = grid.width;
-          const h = grid.height;
-          
-          for (let y = 0; y < h; y++) {
-            for (let x = 0; x < w; x++) {
-              const idx = y * w + x;
-              const cell = grid.getCell(x, y);
-              const anim = cellAnims[idx];
-              
-              if (anim.scale > 0.01 || anim.opacity > 0.01) {
-                const px = x * cellW;
-                const py = y * cellH;
-                const maxRadius = Math.min(cellW, cellH) / 2;
-                // Add a small gap factor (0.45) to separate pixels visually like authentic dots
-                const currentRadius = Math.max(0, maxRadius * anim.scale * 0.45);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
 
-                ctx.beginPath();
-                ctx.arc(px + cellW / 2, py + cellH / 2, currentRadius, 0, Math.PI * 2);
+      // 4. Solid cells — no bloom. Birth/death still punch scale + fade + glitch.
+      ctx.globalCompositeOperation = 'source-over';
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
+          const v = visuals[idx];
+          const drawStrength = Math.max(v.intensity, v.trail * 0.9, v.ghost * 0.75);
+          if (drawStrength < 0.02 && v.flash < 0.02) continue;
 
-                ctx.globalAlpha = anim.opacity;
-                if (viewMode === '1bit') {
-                  ctx.fillStyle = '#ffffff';
-                } else {
-                  ctx.fillStyle = TOKEN_COLORS[cell.emittedToken] || '#ffffff';
-                }
-                ctx.fill();
-                ctx.globalAlpha = 1.0;
-              } else if (cell.fade > 0.04) {
-                // Secondary decay ghosting (from previous grid logic)
-                const px = x * cellW;
-                const py = y * cellH;
-                const maxRadius = Math.min(cellW, cellH) / 2;
-                
-                ctx.beginPath();
-                ctx.arc(px + cellW / 2, py + cellH / 2, maxRadius * 0.45, 0, Math.PI * 2);
-                ctx.globalAlpha = cell.fade * 0.2;
-                ctx.fillStyle = '#ffffff';
-                ctx.fill();
-                ctx.globalAlpha = 1.0;
-              }
-            }
+          const jx =
+            v.jitter > 0
+              ? (Math.sin(v.agePhase * 19.1) * 0.28 + Math.sin(v.agePhase * 41.3) * 0.16) *
+                v.jitter *
+                minCell
+              : 0;
+          const jy =
+            v.jitter > 0
+              ? (Math.cos(v.agePhase * 17.7) * 0.28 + Math.sin(v.agePhase * 37.9) * 0.14) *
+                v.jitter *
+                minCell
+              : 0;
+
+          const cx = (x + 0.5) * cellW + jx;
+          const cy = (y + 0.5) * cellH + jy;
+          const scale = Math.max(
+            v.scale,
+            v.trail * 0.8,
+            v.ghost * 0.9,
+            v.flash * 0.45
+          );
+          if (scale < 0.04) continue;
+
+          let [cr, cg, cb] = [255, 255, 255];
+          if (viewMode === 'dialect') {
+            [cr, cg, cb] = hexToRgb(TOKEN_COLORS[cells[idx].emittedToken] || '#ffffff');
+          }
+
+          const radius = Math.max(0.4, (minCell * CORE_RADIUS * scale) / 2);
+          const alpha = Math.min(1, drawStrength * 1.05 + v.flash * 0.5);
+
+          ctx.globalAlpha = alpha;
+          ctx.fillStyle = `rgba(${cr},${cg},${cb},${alpha})`;
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Birth/death spark — hard fleck + brief RGB tear (glitch, not glow)
+          if (v.flash > 0.12) {
+            ctx.globalAlpha = v.flash;
+            const spark = minCell * 0.32 * (0.5 + v.flash);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(cx - spark / 2, cy - spark / 2, spark, spark);
+            ctx.globalAlpha = v.flash * 0.55;
+            ctx.fillStyle = '#ff5577';
+            ctx.fillRect(cx - spark / 2 - 1.5, cy - spark / 2, spark * 0.65, spark * 0.65);
+            ctx.fillStyle = '#55ffcc';
+            ctx.fillRect(cx - spark / 2 + 1.5, cy - spark / 2, spark * 0.65, spark * 0.65);
           }
         }
       }
 
-      animationFrameId = requestAnimationFrame(renderLoop);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+
+      raf = requestAnimationFrame(renderLoop);
     };
 
-    animationFrameId = requestAnimationFrame(renderLoop);
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [grid, viewMode, showSynapses, cellAnims]);
+    raf = requestAnimationFrame(renderLoop);
+    return () => cancelAnimationFrame(raf);
+  }, [grid, viewMode, showSynapses]);
 
-  // Click & drag interaction to draw cells
   const handlePointer = (e: React.PointerEvent<HTMLCanvasElement>, isClick = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -204,30 +385,6 @@ export const GridCanvas: React.FC<GridCanvasProps> = ({ grid, viewMode, showSyna
       if (isClick || (isMouseDownRef.current && lastDrawnCellRef.current !== key)) {
         lastDrawnCellRef.current = key;
         grid.toggleCell(cellX, cellY);
-        
-        // Ensure manual toggle triggers immediate anime state update for better interaction feel
-        const idx = cellY * grid.width + cellX;
-        const isAlive = grid.cells[idx].alive;
-        prevAliveRef.current[idx] = isAlive;
-        
-        // remove(cellAnims[idx]);
-        if (isAlive) {
-          anime(
-            cellAnims[idx], {
-            scale: 1,
-            opacity: 1,
-            duration: 350,
-            easing: 'easeOutBack',
-          });
-        } else {
-          anime(
-            cellAnims[idx], {
-            scale: 0,
-            opacity: 0,
-            duration: 350,
-            easing: 'easeOutQuad',
-          });
-        }
       }
     }
   };

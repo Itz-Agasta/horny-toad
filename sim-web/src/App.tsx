@@ -20,10 +20,12 @@ export function App() {
 
   const [, setTick] = useState<number>(0);
   const [isRunning, setIsRunning] = useState<boolean>(true);
-  const turnSpeedMs = 450; // 450ms per sub-turn -> 1.35s/gen -> exactly 45 seconds total
+  // Snappier cadence so birth/death pops read like LIFE.gif; elapsed still hits 45s wall-clock
+  const turnSpeedMs = 180;
   const [viewMode, setViewMode] = useState<'1bit' | 'dialect'>('1bit');
   const [showSynapses, setShowSynapses] = useState<boolean>(true);
   const [isCodebookOpen, setIsCodebookOpen] = useState<boolean>(false);
+  const [visualEpoch, setVisualEpoch] = useState<number>(0);
 
   // Stop stepping once evaluation reaches 45 seconds
   const stepTurn = () => {
@@ -50,6 +52,7 @@ export function App() {
 
   const restartWithPreset = (presetFn: () => void) => {
     presetFn();
+    setVisualEpoch((e) => e + 1);
     setIsRunning(true);
     setTick((t) => t + 1);
   };
@@ -141,6 +144,7 @@ export function App() {
           grid={grid}
           viewMode={viewMode}
           showSynapses={showSynapses}
+          visualEpoch={visualEpoch}
         />
 
         {/* Floating Gen & Agent Counter on canvas bottom */}
@@ -196,6 +200,7 @@ export function App() {
               onClick={() => {
                 setIsRunning(false);
                 grid.clear();
+                setVisualEpoch((e) => e + 1);
                 setTick((t) => t + 1);
               }}
               className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-700 text-zinc-400 hover:bg-zinc-800 hover:text-rose-400"
